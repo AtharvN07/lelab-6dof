@@ -1,0 +1,111 @@
+# Copyright 2025 The HuggingFace Inc. team. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import json
+import logging
+import os
+import platform
+import shutil
+import time
+from pathlib import Path
+from typing import Literal
+
+logger = logging.getLogger(__name__)
+
+RobotSide = Literal["leader", "follower"]
+
+# Define the calibration config paths (shared between features)
+CALIBRATION_BASE_PATH_TELEOP = os.path.expanduser("~/.cache/huggingface/lerobot/calibration/teleoperators")
+CALIBRATION_BASE_PATH_ROBOTS = os.path.expanduser("~/.cache/huggingface/lerobot/calibration/robots")
+LEADER_CONFIG_PATH = os.path.join(CALIBRATION_BASE_PATH_TELEOP, "so_leader")
+FOLLOWER_CONFIG_PATH = os.path.join(CALIBRATION_BASE_PATH_ROBOTS, "so_follower")
+
+# Define port storage path
+PORT_CONFIG_PATH = os.path.expanduser("~/.cache/huggingface/lerobot/ports")
+LEADER_PORT_FILE = os.path.join(PORT_CONFIG_PATH, "leader_port.txt")
+FOLLOWER_PORT_FILE = os.path.join(PORT_CONFIG_PATH, "follower_port.txt")
+
+# Define configuration storage path
+CONFIG_STORAGE_PATH = os.path.expanduser("~/.cache/huggingface/lerobot/saved_configs")
+LEADER_CONFIG_FILE = os.path.join(CONFIG_STORAGE_PATH, "leader_config.txt")
+FOLLOWER_CONFIG_FILE = os.path.join(CONFIG_STORAGE_PATH, "follower_config.txt")
+
+# Robot config records (per-robot JSON metadata)
+ROBOTS_PATH = os.path.expanduser("~/.cache/huggingface/lerobot/robots")
+
+# Tag stamped on every dataset pushed to the Hub from LeLab, so we can later
+# query the Hub for LeLab-produced datasets and compute usage metrics.
+LELAB_TAG = "LeLab"
+
+
+def with_lelab_tag(tags: list[str] | None) -> list[str]:
+    """Return `tags` with LELAB_TAG appended (deduped, order preserved)."""
+    out = list(tags or [])
+    if LELAB_TAG not in out:
+        out.append(LELAB_TAG)
+    return out
+
+
+def _atomic_write_text(path: str, content: str) -> None:
+    """Write to <path>.tmp then os.replace, so a crash mid-write never leaves
+    a half-written file on disk."""
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
+    tmp = f"{path}.tmp"
+    with open(tmp, "w") as f:
+        f.write(content)
+    os.replace(tmp, path)
+
+
+def _port_file_for(robot_type: RobotSide) -> str:
+    if robot_type == "leader":
+        return LEADER_PORT_FILE
+    if robot_type == "follower":
+        return FOLLOWER_PORT_FILE
+    raise ValueError(f"robot_type must be 'leader' or 'follower', got {robot_type!r}")
+
+
+def _config_file_for(robot_type: RobotSide) -> str:
+    rt = robot_type.lower() if isinstance(robot_type, str) else robot_type
+    if rt == "leader":
+        return LEADER_CONFIG_FILE
+    if rt == "follower":
+        return FOLLOWER_CONFIG_FILE
+    raise ValueError(f"robot_type must be 'leader' or 'follower', got {robot_type!r}")
+
+
+def setup_calibration_files(leader_config: str, follower_config: str):
+    """Validate leader calibration and optional follower calibration.
+
+    An empty follower_config means standalone mode. It does not create a
+    fake follower calibration or change any calibration ranges.
+    """
+    leader_config_name = os.path.splitext(leader_config)[0]
+    if not leader_config_name:
+        raise ValueError("Leader calibration name is required")
+
+    leader_path = os.path.join(LEADER_CONFIG_PATH, leader_config)
+    if not os.path.isfile(leader_path):
+        raise FileNotFoundError(f"Leader calibration file not found: {leader_path}")
+
+    if not follower_config or not follower_config.strip():
+        logger.info("Standalone recording configuration: no follower calibration requested")
+        return leader_config_name, ""
+
+    follower_config_name = os.path.splitext(follower_config)[0]
+    follower_path = os.path.join(FOLLOWER_CONFIG_PATH, follower_config)
+    if not follower_config_name or not os.path.isfile(follower_path):
+        raise FileNotFoundError(f"Follower calibration file not found: {follower_path}")
+
+    return leader_config_name, follower_config_name

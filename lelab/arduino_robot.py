@@ -43,8 +43,8 @@ AXIS_RT = 5
 
 BTN_GRIPPER_CLOSE = 0
 BTN_GRIPPER_OPEN = 1
-BTN_ELBOW_DOWN = 5
-BTN_ELBOW_UP = 6
+BTN_ELBOW_DOWN = 4
+BTN_ELBOW_UP = 5
 
 STICK_DEADZONE = 0.15
 TRIGGER_THRESHOLD = 0.5
@@ -297,9 +297,11 @@ class ArduinoLeader(Teleoperator):
         self._gamepad = None
         self._gamepad_backend = None
         self._pygame_ready = False
+        self._gamepad_lock = threading.RLock()
         self._gamepad_thread: threading.Thread | None = None
         self._owns_driver = True
         self._gripper_wire = 0
+        self._prev_home_button = False
         self._last_action: dict = {f"{m}.pos": 0.0 for m in CONTINUOUS_MOTORS}
 
     # -- driver sharing ---------------------------------------------------
@@ -318,15 +320,13 @@ class ArduinoLeader(Teleoperator):
         self.start_gamepad_search()
 
     def start_gamepad_search(self) -> None:
-        """Start the background gamepad search (idempotent)."""
-        if self._gamepad_thread is not None and self._gamepad_thread.is_alive():
-            return
-        self._gamepad_thread = threading.Thread(
-            target=self._init_gamepad, name="arduino-leader-gamepad", daemon=True
-        )
-        self._gamepad_thread.start()
+        """Do not initialize Pygame from a background thread.
 
-    # -- gamepad ----------------------------------------------------------
+        Gamepad initialization is performed lazily by get_action(), in the
+        same worker thread that polls the joystick during calibration.
+        """
+        # Intentionally do not launch _init_gamepad in another thread.
+        return
 
     def _init_gamepad(self) -> None:
         """Attach the ARIS controller, retrying while it is unavailable.
@@ -369,12 +369,8 @@ class ArduinoLeader(Teleoperator):
             # and does not refresh it on its own. Rebuild that list on every
             # retry so a controller that is plugged in (or woken) later is
             # picked up. This is portable - no macOS-only HID inspection.
-            if getattr(self, "_pygame_ready", False):
-                try:
-                    pygame.joystick.quit()
-                    pygame.joystick.init()
-                except Exception:
-                    pass
+            # Do not quit/reinitialize the joystick subsystem on retries.
+            # Doing so invalidates joystick objects that are already open.
 
             count = pygame.joystick.get_count()
             if count > 0:
@@ -518,14 +514,24 @@ class ArduinoLeader(Teleoperator):
                 return action
 
         try:
-            if self._gamepad_backend == "inputs":
-                axes, buttons = self._read_inputs_state()
-            else:
-                import pygame
+            with self._gamepad_lock:
+                if self._gamepad is None:
+                    return action
 
-                pygame.event.pump()
-                axes = [self._gamepad.get_axis(i) for i in range(self._gamepad.get_numaxes())]
-                buttons = [self._gamepad.get_button(i) for i in range(self._gamepad.get_numbuttons())]
+                if self._gamepad_backend == "inputs":
+                    axes, buttons = self._read_inputs_state()
+                else:
+                    import pygame
+
+                    pygame.event.pump()
+                    axes = [
+                        self._gamepad.get_axis(i)
+                        for i in range(self._gamepad.get_numaxes())
+                    ]
+                    buttons = [
+                        self._gamepad.get_button(i)
+                        for i in range(self._gamepad.get_numbuttons())
+                    ]
 
             def axis(i):
                 if i >= len(axes):
@@ -535,6 +541,18 @@ class ArduinoLeader(Teleoperator):
 
             def pressed(i):
                 return i < len(buttons) and bool(buttons[i])
+
+            # X button (index 2): send HOME once per button press.
+            home_pressed = pressed(2)
+            if home_pressed and not self._prev_home_button:
+                self._prev_home_button = True
+                print("[ArduinoLeader] X pressed: sending HOME command")
+                self._driver.home()
+                self._last_action = {
+                    f"{m}.pos": 0.0 for m in CONTINUOUS_MOTORS
+                }
+                return dict(self._last_action)
+            self._prev_home_button = home_pressed
 
             def trigger(i):
                 """Triggers rest at -1 and reach +1 when pressed -> 0..1."""
@@ -586,3 +604,4 @@ class ArduinoLeader(Teleoperator):
             except Exception:
                 pass
             self._gamepad = None
+

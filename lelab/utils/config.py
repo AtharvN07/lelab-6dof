@@ -86,48 +86,27 @@ def _config_file_for(robot_type: RobotSide) -> str:
 
 
 def setup_calibration_files(leader_config: str, follower_config: str):
-    """Setup calibration files in the correct locations for teleoperation and recording"""
-    # Extract config names from file paths (remove .json extension)
+    """Validate leader calibration and optional follower calibration.
+
+    An empty follower_config means standalone mode. It does not create a
+    fake follower calibration or change any calibration ranges.
+    """
     leader_config_name = os.path.splitext(leader_config)[0]
+    if not leader_config_name:
+        raise ValueError("Leader calibration name is required")
+
+    leader_path = os.path.join(LEADER_CONFIG_PATH, leader_config)
+    if not os.path.isfile(leader_path):
+        raise FileNotFoundError(f"Leader calibration file not found: {leader_path}")
+
+    if not follower_config or not follower_config.strip():
+        logger.info("Standalone recording configuration: no follower calibration requested")
+        return leader_config_name, ""
+
     follower_config_name = os.path.splitext(follower_config)[0]
-
-    # Log the full paths to check if files exist
-    leader_config_full_path = os.path.join(LEADER_CONFIG_PATH, leader_config)
-    follower_config_full_path = os.path.join(FOLLOWER_CONFIG_PATH, follower_config)
-
-    logger.info("Checking calibration files:")
-    logger.info(f"Leader config path: {leader_config_full_path}")
-    logger.info(f"Follower config path: {follower_config_full_path}")
-    logger.info(f"Leader config exists: {os.path.exists(leader_config_full_path)}")
-    logger.info(f"Follower config exists: {os.path.exists(follower_config_full_path)}")
-
-    # Create calibration directories if they don't exist
-    leader_calibration_dir = LEADER_CONFIG_PATH
-    follower_calibration_dir = FOLLOWER_CONFIG_PATH
-    os.makedirs(leader_calibration_dir, exist_ok=True)
-    os.makedirs(follower_calibration_dir, exist_ok=True)
-
-    # Copy calibration files to the correct locations if they're not already there
-    leader_target_path = os.path.join(leader_calibration_dir, f"{leader_config_name}.json")
-    follower_target_path = os.path.join(follower_calibration_dir, f"{follower_config_name}.json")
-
-    if not os.path.exists(leader_target_path):
-        if os.path.exists(leader_config_full_path):
-            shutil.copy2(leader_config_full_path, leader_target_path)
-            logger.info(f"Copied leader calibration to {leader_target_path}")
-        else:
-            raise FileNotFoundError(f"Leader calibration file not found: {leader_config_full_path}")
-    else:
-        logger.info(f"Leader calibration already exists at {leader_target_path}")
-
-    if not os.path.exists(follower_target_path):
-        if os.path.exists(follower_config_full_path):
-            shutil.copy2(follower_config_full_path, follower_target_path)
-            logger.info(f"Copied follower calibration to {follower_target_path}")
-        else:
-            raise FileNotFoundError(f"Follower calibration file not found: {follower_config_full_path}")
-    else:
-        logger.info(f"Follower calibration already exists at {follower_target_path}")
+    follower_path = os.path.join(FOLLOWER_CONFIG_PATH, follower_config)
+    if not follower_config_name or not os.path.isfile(follower_path):
+        raise FileNotFoundError(f"Follower calibration file not found: {follower_path}")
 
     return leader_config_name, follower_config_name
 
@@ -163,41 +142,29 @@ def setup_follower_calibration_file(follower_config: str):
     return follower_config_name
 
 
-def find_available_ports():
-    """Find all available serial ports on the system"""
-    try:
-        from serial.tools import list_ports  # Part of pyserial library
-    except ImportError as exc:
-        raise ImportError("pyserial library is required. Install it with: pip install pyserial") from exc
-
-    if platform.system() == "Windows":
-        # List COM ports using pyserial
-        ports = [port.device for port in list_ports.comports()]
-    else:  # Linux/macOS
-        # List /dev/tty* ports for Unix-based systems
-        ports = [str(path) for path in Path("/dev").glob("tty*")]
-    return sorted(ports)
+def _empty_record(name: str) -> dict:
+    record: dict = {"name": name, "standalone": False}
+    for field in _ROBOT_STRING_FIELDS:
+        record[field] = ""
+    for field in _ROBOT_LIST_FIELDS:
+        record[field] = []
+    return record
 
 
-def find_robot_port(robot_type="robot"):
-    """
-    Find the port for a robot by detecting the difference when disconnecting/reconnecting
+def _robot_record_path(name: str) -> str:
+    return os.path.join(ROBOTS_PATH, f"{name}.json")
 
-    Args:
-        robot_type (str): Type of robot ("leader" or "follower" or generic "robot")
 
-    Returns:
-        str: The detected port
-    """
-    logger.info(f"Finding port for {robot_type}")
-
-    # Get initial ports
-    ports_before = find_available_ports()
-    logger.info(f"Ports before disconnecting: {ports_before}")
-
-    # This function returns the port detection logic, but the actual user interaction
-    # should be handled by the frontend
-    return {"ports_before": ports_before, "robot_type": robot_type}
+def delete_robot_record(name: str) -> bool:
+    """Delete a robot record. Returns True if a file was removed."""
+    if not is_valid_robot_name(name):
+        return False
+    path = _robot_record_path(name)
+    if not os.path.exists(path):
+        return False
+    os.remove(path)
+    logger.info(f"Deleted robot record {name}")
+    return True
 
 
 def detect_port_after_disconnect(ports_before, timeout_s: float = 15.0, poll_interval_s: float = 0.3):
@@ -243,23 +210,54 @@ def detect_port_after_disconnect(ports_before, timeout_s: float = 15.0, poll_int
     )
 
 
-def save_robot_port(robot_type: RobotSide, port: str) -> None:
-    """Persist the robot port for `robot_type` ('leader' or 'follower')."""
-    port_file = _port_file_for(robot_type)
-    _atomic_write_text(port_file, port)
-    logger.info(f"Saved {robot_type} port: {port}")
+def find_available_ports():
+    """Find all available serial ports on the system"""
+    try:
+        from serial.tools import list_ports  # Part of pyserial library
+    except ImportError as exc:
+        raise ImportError("pyserial library is required. Install it with: pip install pyserial") from exc
+
+    if platform.system() == "Windows":
+        # List COM ports using pyserial
+        ports = [port.device for port in list_ports.comports()]
+    else:  # Linux/macOS
+        # List /dev/tty* ports for Unix-based systems
+        ports = [str(path) for path in Path("/dev").glob("tty*")]
+    return sorted(ports)
 
 
-def get_saved_robot_port(robot_type: RobotSide) -> str | None:
-    """Return the saved port for `robot_type`, or None if no file exists."""
-    port_file = _port_file_for(robot_type)
-    if not os.path.exists(port_file):
-        logger.info(f"No saved port found for {robot_type}")
-        return None
-    with open(port_file) as f:
-        port = f.read().strip()
-    logger.info(f"Retrieved saved {robot_type} port: {port}")
-    return port
+def find_robot_port(robot_type="robot"):
+    """
+    Find the port for a robot by detecting the difference when disconnecting/reconnecting
+
+    Args:
+        robot_type (str): Type of robot ("leader" or "follower" or generic "robot")
+
+    Returns:
+        str: The detected port
+    """
+    logger.info(f"Finding port for {robot_type}")
+
+    # Get initial ports
+    ports_before = find_available_ports()
+    logger.info(f"Ports before disconnecting: {ports_before}")
+
+    # This function returns the port detection logic, but the actual user interaction
+    # should be handled by the frontend
+    return {"ports_before": ports_before, "robot_type": robot_type}
+
+
+def get_default_robot_config(robot_type: str, available_configs: list):
+    """Get the default configuration for a robot, checking saved configs first"""
+    saved_config = get_saved_robot_config(robot_type)
+    if saved_config and saved_config in available_configs:
+        return saved_config
+
+    # Return first available config as fallback
+    if available_configs:
+        return available_configs[0]
+
+    return None
 
 
 def get_default_robot_port(robot_type: RobotSide) -> str:
@@ -272,19 +270,22 @@ def get_default_robot_port(robot_type: RobotSide) -> str:
     return "/dev/ttyUSB0"
 
 
-def save_robot_config(robot_type: RobotSide, config_name: str) -> bool:
+def get_robot_record(name: str) -> dict | None:
+    """Return the robot record by name, or None if missing."""
+    path = _robot_record_path(name)
+    if not os.path.exists(path):
+        return None
     try:
-        config_file_path = _config_file_for(robot_type)
-    except ValueError as e:
-        logger.error(str(e))
-        return False
-    try:
-        _atomic_write_text(config_file_path, config_name.strip())
-    except Exception as e:
-        logger.error(f"Error saving {robot_type} configuration: {e}")
-        return False
-    logger.info(f"Saved {robot_type} configuration: {config_name}")
-    return True
+        with open(path) as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        logger.error(f"Failed to read robot record {name}: {e}")
+        return None
+    # Ensure all expected fields exist (forward/back compat)
+    record = _empty_record(name)
+    record.update({k: v for k, v in data.items() if k in record})
+    record["name"] = name
+    return record
 
 
 def get_saved_robot_config(robot_type: RobotSide) -> str | None:
@@ -308,31 +309,49 @@ def get_saved_robot_config(robot_type: RobotSide) -> str | None:
     return config_name
 
 
-def get_default_robot_config(robot_type: str, available_configs: list):
-    """Get the default configuration for a robot, checking saved configs first"""
-    saved_config = get_saved_robot_config(robot_type)
-    if saved_config and saved_config in available_configs:
-        return saved_config
-
-    # Return first available config as fallback
-    if available_configs:
-        return available_configs[0]
-
-    return None
-
-
-# ---------------------------------------------------------------------------
-# Robot record helpers
-# ---------------------------------------------------------------------------
-
-# Characters disallowed in a robot name (filesystem safety)
-_INVALID_NAME_CHARS = ("/", "\\", "..")
-_ROBOT_STRING_FIELDS = ("leader_port", "follower_port", "leader_config", "follower_config")
-_ROBOT_LIST_FIELDS = ("cameras",)
+def get_saved_robot_port(robot_type: RobotSide) -> str | None:
+    """Return the saved port for `robot_type`, or None if no file exists."""
+    port_file = _port_file_for(robot_type)
+    if not os.path.exists(port_file):
+        logger.info(f"No saved port found for {robot_type}")
+        return None
+    with open(port_file) as f:
+        port = f.read().strip()
+    logger.info(f"Retrieved saved {robot_type} port: {port}")
+    return port
 
 
-def _robot_record_path(name: str) -> str:
-    return os.path.join(ROBOTS_PATH, f"{name}.json")
+def is_robot_record_clean(record: dict) -> bool:
+    """
+    Validate a standalone leader arm or a normal leader-follower robot.
+    Cameras are optional and do not affect cleanliness.
+    """
+    if not record:
+        return False
+
+    leader_port = record.get("leader_port", "")
+    leader_config = record.get("leader_config", "")
+
+    if not isinstance(leader_port, str) or not leader_port.strip():
+        return False
+    if not isinstance(leader_config, str) or not leader_config.strip():
+        return False
+
+    leader_path = os.path.join(LEADER_CONFIG_PATH, leader_config)
+    if not os.path.isfile(leader_path):
+        return False
+
+    # Standalone mode is opt-in; normal records retain strict validation.
+    if record.get("standalone") is True:
+        return True
+
+    for field in ("follower_port", "follower_config"):
+        value = record.get(field, "")
+        if not isinstance(value, str) or not value.strip():
+            return False
+
+    follower_path = os.path.join(FOLLOWER_CONFIG_PATH, record["follower_config"])
+    return os.path.isfile(follower_path) and bool(record["follower_port"].strip())
 
 
 def is_valid_robot_name(name: str) -> bool:
@@ -342,33 +361,6 @@ def is_valid_robot_name(name: str) -> bool:
     if name.strip() != name:
         return False
     return not any(bad in name for bad in _INVALID_NAME_CHARS)
-
-
-def _empty_record(name: str) -> dict:
-    record: dict = {"name": name}
-    for field in _ROBOT_STRING_FIELDS:
-        record[field] = ""
-    for field in _ROBOT_LIST_FIELDS:
-        record[field] = []
-    return record
-
-
-def get_robot_record(name: str) -> dict | None:
-    """Return the robot record by name, or None if missing."""
-    path = _robot_record_path(name)
-    if not os.path.exists(path):
-        return None
-    try:
-        with open(path) as f:
-            data = json.load(f)
-    except (json.JSONDecodeError, OSError) as e:
-        logger.error(f"Failed to read robot record {name}: {e}")
-        return None
-    # Ensure all expected fields exist (forward/back compat)
-    record = _empty_record(name)
-    record.update({k: v for k, v in data.items() if k in record})
-    record["name"] = name
-    return record
 
 
 def list_robot_records() -> list[dict]:
@@ -384,6 +376,28 @@ def list_robot_records() -> list[dict]:
         if record is not None:
             records.append(record)
     return records
+
+
+def save_robot_config(robot_type: RobotSide, config_name: str) -> bool:
+    try:
+        config_file_path = _config_file_for(robot_type)
+    except ValueError as e:
+        logger.error(str(e))
+        return False
+    try:
+        _atomic_write_text(config_file_path, config_name.strip())
+    except Exception as e:
+        logger.error(f"Error saving {robot_type} configuration: {e}")
+        return False
+    logger.info(f"Saved {robot_type} configuration: {config_name}")
+    return True
+
+
+def save_robot_port(robot_type: RobotSide, port: str) -> None:
+    """Persist the robot port for `robot_type` ('leader' or 'follower')."""
+    port_file = _port_file_for(robot_type)
+    _atomic_write_text(port_file, port)
+    logger.info(f"Saved {robot_type} port: {port}")
 
 
 def save_robot_record(name: str, data: dict, allow_create: bool = True) -> bool:
@@ -420,31 +434,6 @@ def save_robot_record(name: str, data: dict, allow_create: bool = True) -> bool:
     logger.info(f"Saved robot record {name}: {record}")
     return True
 
-
-def delete_robot_record(name: str) -> bool:
-    """Delete a robot record. Returns True if a file was removed."""
-    if not is_valid_robot_name(name):
-        return False
-    path = _robot_record_path(name)
-    if not os.path.exists(path):
-        return False
-    os.remove(path)
-    logger.info(f"Deleted robot record {name}")
-    return True
-
-
-def is_robot_record_clean(record: dict) -> bool:
-    """
-    A record is 'clean' when all four operational fields are populated AND both
-    referenced calibration files exist on disk. Cameras are optional and don't
-    affect cleanliness.
-    """
-    if not record:
-        return False
-    for field in _ROBOT_STRING_FIELDS:
-        value = record.get(field, "")
-        if not isinstance(value, str) or not value.strip():
-            return False
-    leader_path = os.path.join(LEADER_CONFIG_PATH, record["leader_config"])
-    follower_path = os.path.join(FOLLOWER_CONFIG_PATH, record["follower_config"])
-    return os.path.exists(leader_path) and os.path.exists(follower_path)
+_INVALID_NAME_CHARS = ("/", "\\", "..")
+_ROBOT_STRING_FIELDS = ("leader_port", "follower_port", "leader_config", "follower_config")
+_ROBOT_LIST_FIELDS = ("cameras",)

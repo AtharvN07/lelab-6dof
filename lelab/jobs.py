@@ -122,11 +122,18 @@ class MetricsHistoryPoint(BaseModel):
 
 
 def _pid_alive(pid: int) -> bool:
-    """Return True if a process with this PID exists. Cheap; uses signal 0."""
+    """Return True if a process with this PID exists; handle Windows errors."""
     try:
         os.kill(pid, 0)
-    except (ProcessLookupError, PermissionError):
+    except ProcessLookupError:
         return False
+    except PermissionError:
+        return True
+    except OSError as exc:
+        # Windows may raise WinError 11 when checking a stale or invalid PID.
+        if os.name == "nt" and getattr(exc, "winerror", None) == 11:
+            return False
+        raise
     return True
 
 

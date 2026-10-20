@@ -29,6 +29,7 @@ from lerobot.utils.utils import init_logging
 
 from .utils.devices import safe_disconnect_device
 from .arduino_driver import ArduinoRobotDriver
+from .arduino_robot import ArduinoLeader, ArduinoLeaderConfig, CONTINUOUS_MOTORS
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +72,9 @@ class CalibrationManager:
     def __init__(self):
         self.status = CalibrationStatus()
         self.device: ArduinoRobotDriver | None = None
+        self.gamepad_leader: ArduinoLeader | None = None
+        self._gamepad_stop = threading.Event()
+        self._gamepad_thread: threading.Thread | None = None
         self.calibration_thread: threading.Thread | None = None
         self.stop_calibration = False
         self._status_lock = threading.Lock()
@@ -189,6 +193,11 @@ class CalibrationManager:
             self._update_status(status="connecting", message="Connecting to Arduino...")
             logger.info("Connecting Arduino...")
             self.device.connect()
+            # Share the calibration driver's serial connection; never open COM9 twice.
+            self.gamepad_leader = ArduinoLeader(
+                ArduinoLeaderConfig(port=request.port)
+            )
+            self.gamepad_leader.share_driver(self.device)
 
             if self.stop_calibration:
                 logger.info("Calibration stopped after device connection")
@@ -283,6 +292,13 @@ class CalibrationManager:
 
         self._recording_active = True
         prev_positions: dict[str, int] = dict(self._start_positions)
+        self._gamepad_stop.clear()
+        self._gamepad_thread = threading.Thread(
+            target=self._calibration_gamepad_loop,
+            name="calibration-gamepad-control",
+            daemon=True,
+        )
+        self._gamepad_thread.start()
 
         while not self._step_complete.is_set() and not self.stop_calibration:
             try:
@@ -327,6 +343,11 @@ class CalibrationManager:
                 logger.warning(f"Error reading positions during recording: {e}")
                 time.sleep(0.2)
 
+        self._gamepad_stop.set()
+        if self._gamepad_thread and self._gamepad_thread.is_alive():
+            self._gamepad_thread.join(timeout=1.0)
+        self._gamepad_thread = None
+
         if self.stop_calibration:
             logger.info("Range recording step cancelled due to stop request")
             return
@@ -360,6 +381,106 @@ class CalibrationManager:
 
         self._step_complete.clear()
         logger.info("Range recording step completed")
+
+    def _calibration_gamepad_loop(self):
+        """Read gamepad, log raw inputs and commands, and move slowly."""
+        leader = self.gamepad_leader
+        driver = self.device
+
+        if leader is None or driver is None:
+            logger.error("Calibration gamepad/Arduino is not initialized")
+            return
+
+        import pygame
+
+        axis_names = {
+            0: "LEFT_X / BASE",
+            1: "LEFT_Y / SHOULDER",
+            2: "RIGHT_X / ROTATE",
+            3: "RIGHT_Y / WRIST",
+            4: "LEFT_TRIGGER / ELBOW_DOWN",
+            5: "RIGHT_TRIGGER / ELBOW_UP",
+        }
+        button_names = {
+            0: "A / GRIPPER_CLOSE",
+            1: "B / GRIPPER_OPEN",
+            2: "X",
+            3: "Y",
+            4: "L1 / ELBOW_DOWN",
+            5: "R1 / ELBOW_UP",
+        }
+
+        logger.info("DETAILED GAMEPAD DEBUG ACTIVE")
+        logger.info("Move only one control at a time; watch the terminal.")
+
+        last_debug = 0.0
+
+        while not self._gamepad_stop.is_set() and not self.stop_calibration:
+            try:
+                action = leader.get_action()
+                gp = leader._gamepad
+                axes = []
+                buttons = []
+                pressed_names = []
+
+                if gp is not None and leader._gamepad_backend == "pygame":
+                    # get_action() already pumps the pygame event queue.
+                    axes = [
+                        round(float(gp.get_axis(i)), 3)
+                        for i in range(gp.get_numaxes())
+                    ]
+                    buttons = [
+                        int(gp.get_button(i))
+                        for i in range(gp.get_numbuttons())
+                    ]
+                    pressed_names = [
+                        button_names.get(i, f"BUTTON_{i}")
+                        for i, value in enumerate(buttons)
+                        if value
+                    ]
+
+                deltas = []
+                for motor in CONTINUOUS_MOTORS:
+                    value = float(action.get(f"{motor}.pos", 0.0))
+                    if abs(value) < 0.15:
+                        deltas.append(0)
+                    else:
+                        deltas.append(1 if value > 0 else -1)
+
+                wire = getattr(driver, "gripper_wire", 0)
+                driver.send_delta(deltas, wire)
+
+                now = time.monotonic()
+                if now - last_debug >= 1.0:
+                    active_axes = {
+                        axis_names.get(i, f"AXIS_{i}"): value
+                        for i, value in enumerate(axes)
+                        if abs(value) > 0.15
+                    }
+                    print(
+                        "\\n[CALIBRATION GAMEPAD DEBUG]"
+                        f"\\n  backend       = {leader._gamepad_backend}"
+                        f"\\n  device        = {gp.get_name() if gp else None}"
+                        f"\\n  raw_axes      = {axes}"
+                        f"\\n  active_axes   = {active_axes}"
+                        f"\\n  raw_buttons   = {buttons}"
+                        f"\\n  pressed       = {pressed_names}"
+                        f"\\n  mapped_action = {action}"
+                        f"\\n  sent_deltas   = {deltas} "
+                        "(base, shoulder, elbow, wrist, rotate)"
+                        f"\\n  gripper_wire  = {wire}"
+                        "\\n----------------------------------------",
+                        flush=True,
+                    )
+                    last_debug = now
+
+            except Exception:
+                logger.exception("Calibration gamepad control failed")
+                time.sleep(0.2)
+
+            time.sleep(0.12)
+
+        logger.info("Calibration gamepad control stopped")
 
     def _complete_calibration(self):
         """Complete the calibration and save results to disk."""
@@ -429,6 +550,16 @@ class CalibrationManager:
         self._update_status(calibration_active=False, status=status, message=message)
 
     def _cleanup_device(self):
+        self._gamepad_stop.set()
+        if self._gamepad_thread and self._gamepad_thread.is_alive():
+            self._gamepad_thread.join(timeout=1.0)
+        self._gamepad_thread = None
+        if self.gamepad_leader:
+            try:
+                self.gamepad_leader.disconnect()
+            except Exception:
+                logger.exception("Error disconnecting calibration gamepad")
+            self.gamepad_leader = None
         if self.device:
             logger.info("Disconnecting Arduino...")
             if hasattr(self.device, 'disconnect'):
