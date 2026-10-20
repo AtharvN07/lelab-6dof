@@ -63,10 +63,13 @@ def find_arduino_port() -> str | None:
         if port.vid in ARDUINO_VENDOR_IDS:
             return port.device
 
-    # No vendor match: take the first serial port that is not a Bluetooth
-    # pseudo-port.
+    # No vendor match: take the first serial port that is a real device.
+    # macOS exposes internal pseudo-ports (debug-console, Bluetooth, ...) that
+    # must be skipped.
+    internal = ("debug-console", "bluetooth", "wlan", "modem", "irda", "cu.debug")
     for port in ports:
-        if "bluetooth" in port.device.lower():
+        name = port.device.lower()
+        if any(token in name for token in internal):
             continue
         return port.device
 
