@@ -25,14 +25,13 @@ from pydantic import BaseModel, field_validator
 
 from lerobot.configs.dataset import DatasetRecordConfig
 from lerobot.datasets import LeRobotDataset
-from lerobot.robots.so_follower import SO101FollowerConfig
 
 # Import the main record functionality to reuse it
 from lerobot.scripts.lerobot_record import RecordConfig
-from lerobot.teleoperators.so_leader import SO101LeaderConfig
 
 from .camera_config import lerobot_camera_settings, validate_camera_rotations
 from .episode_media import UnreadableDatasetError, ensure_episode_index
+from .arduino_robot import ArduinoFollowerConfig, ArduinoLeaderConfig
 from .utils.config import setup_calibration_files, with_lelab_tag
 from .utils.devices import safe_disconnect_device
 
@@ -191,14 +190,14 @@ def create_record_config(request: RecordingRequest) -> RecordConfig:
     camera_configs = _build_camera_configs(request.cameras, _platform_backend())
 
     # Create robot config
-    robot_config = SO101FollowerConfig(
+    robot_config = ArduinoFollowerConfig(
         port=request.follower_port,
         id=follower_config_name,
         cameras=camera_configs,
     )
 
     # Create teleop config
-    teleop_config = SO101LeaderConfig(
+    teleop_config = ArduinoLeaderConfig(
         port=request.leader_port,
         id=leader_config_name,
     )
@@ -333,7 +332,7 @@ def handle_start_recording(request: RecordingRequest) -> dict[str, Any]:
                         "Waiting for camera resources to be released (cameras: %s)",
                         list(request.cameras.keys()),
                     )
-                    time.sleep(2.0)
+                    time.sleep(8.0)
 
                 dataset = record_with_web_events(record_config, recording_events)
                 logger.info(f"Recording completed successfully. Dataset has {dataset.num_episodes} episodes")
@@ -790,6 +789,7 @@ def record_with_web_events(cfg: RecordConfig, web_events: dict) -> LeRobotDatase
     )
     from lerobot.datasets import LeRobotDataset
     from lerobot.processor import make_default_processors
+    from .arduino_robot import ArduinoFollower, ArduinoLeader  # noqa: F401  (registers configs)
     from lerobot.robots import make_robot_from_config
     from lerobot.scripts.lerobot_record import record_loop
     from lerobot.teleoperators import make_teleoperator_from_config
@@ -862,7 +862,10 @@ def record_with_web_events(cfg: RecordConfig, web_events: dict) -> LeRobotDatase
         try:
             logger.info("🔧 ROBOT CONNECTION: Attempting to connect robot...")
             robot.bus.connect()
-            logger.info("✅ ROBOT CONNECTION: Robot bus connected successfully")
+            logger.info(
+                f"✅ ROBOT CONNECTION: Robot bus connected successfully "
+                f"(robot={type(robot).__name__}, teleop={type(teleop).__name__ if teleop is not None else None})"
+            )
         except Exception as e:
             logger.error(f"❌ ROBOT CONNECTION: Failed to connect robot: {e}")
             raise
@@ -870,14 +873,40 @@ def record_with_web_events(cfg: RecordConfig, web_events: dict) -> LeRobotDatase
         if teleop is not None:
             try:
                 logger.info("🔧 TELEOP CONNECTION: Attempting to connect teleoperator...")
-                teleop.bus.connect()
-                logger.info("✅ TELEOP CONNECTION: Teleoperator bus connected successfully")
+                # The leader and follower are the same physical Arduino, so the
+                # leader reuses the follower's open serial connection instead
+                # of opening the port a second time.
+                if getattr(robot, "_driver", None) is not None and hasattr(teleop, "share_driver"):
+                    teleop.share_driver(robot._driver)
+                    teleop.bus.is_connected = True
+                    logger.info(
+                        f"✅ TELEOP CONNECTION: Teleoperator shares the follower connection "
+                        f"(teleop={type(teleop).__name__}, gamepad={'yes' if getattr(teleop, '_gamepad', None) is not None else 'NO'})"
+                    )
+                else:
+                    teleop.bus.connect()
+                    logger.info("✅ TELEOP CONNECTION: Teleoperator bus connected successfully")
             except Exception as e:
                 logger.error(f"❌ TELEOP CONNECTION: Failed to connect teleoperator: {e}")
                 raise
 
         # Torque is still disabled at this point, which is what writing the
         # calibration registers requires.
+        # Give the leader's background gamepad search a moment to attach the
+        # controller. Without it the first frames of an episode would be
+        # recorded with zero actions.
+        if teleop is not None:
+            for _ in range(50):
+                if getattr(teleop, "_gamepad", None) is not None:
+                    logger.info("⏳ Gamepad attached - ready to record")
+                    break
+                time.sleep(0.1)
+            else:
+                logger.warning(
+                    "⚠️ No gamepad attached after 5s - actions will stay at zero. "
+                    "Turn the ARIS on and make sure no other program holds it."
+                )
+
         logger.info("Writing calibration to motors...")
         robot.bus.write_calibration(robot.calibration)
         if teleop is not None:
@@ -889,9 +918,27 @@ def record_with_web_events(cfg: RecordConfig, web_events: dict) -> LeRobotDatase
                 cam.connect()
             logger.info("✅ CAMERA CONNECTION: Cameras connected successfully")
         except Exception as e:
-            logger.error(f"❌ CAMERA CONNECTION: Failed to connect cameras: {e}")
-            logger.error("💡 Make sure frontend camera streams are released before recording")
-            raise
+            # The browser's camera preview can still hold the device. Retry a few
+            # times with a short pause before giving up.
+            logger.error(f"⚠️ CAMERA CONNECTION: First attempt failed: {e}")
+            connected = False
+            for attempt in range(5):
+                time.sleep(3.0)
+                try:
+                    for cam_name, cam in robot.cameras.items():
+                        if not getattr(cam, "is_connected", False):
+                            cam.connect()
+                        else:
+                            cam.connect()
+                    connected = True
+                    break
+                except Exception as retry_err:
+                    logger.warning(f"⚠️ CAMERA CONNECTION: retry {attempt + 1}/5 failed: {retry_err}")
+            if not connected:
+                logger.error("❌ CAMERA CONNECTION: Failed to connect cameras after retries")
+                logger.error("💡 Close the camera preview panel / other apps using the cameras, then retry")
+                raise
+            logger.info("✅ CAMERA CONNECTION: Cameras connected after retry")
 
         logger.info("Configuring motors...")
         robot.configure()
@@ -970,7 +1017,9 @@ def record_with_web_events(cfg: RecordConfig, web_events: dict) -> LeRobotDatase
 
             logger.info(f"Recording phase completed - events state: {web_events}")
 
-            # Check if exit_early was triggered (use our tracking flag)
+            # A phase that ends because it reached its time limit is a
+            # COMPLETE episode, not a failed take: it must be saved. Only an
+            # explicit re-record request from the UI discards the data.
             recording_interrupted_by_exit_early = web_events.get("_exit_early_triggered", False)
             if recording_interrupted_by_exit_early:
                 logger.info("🟡 RECORDING PHASE INTERRUPTED BY EXIT_EARLY - proceeding to save episode")
@@ -980,12 +1029,12 @@ def record_with_web_events(cfg: RecordConfig, web_events: dict) -> LeRobotDatase
                 # Reset our tracking flag
                 web_events["_exit_early_triggered"] = False
             else:
-                # Recording completed due to timeout - trigger re-record behavior
-                logger.info("⏰ RECORDING PHASE COMPLETED DUE TO TIMEOUT - triggering re-record")
+                # The phase ran its full length - that is a normal, finished
+                # episode. Keep the data and move on to the next one.
+                logger.info("✅ RECORDING PHASE COMPLETED (time limit reached) - saving episode")
                 print(
-                    f"⏰ STATUS CHANGE: Recording timeout reached for episode {current_episode} - re-recording"
+                    f"✅ STATUS CHANGE: Episode {current_episode} completed - data collected"
                 )
-                web_events["rerecord_episode"] = True
 
             # Handle rerecord logic first (before saving)
             if web_events["rerecord_episode"]:

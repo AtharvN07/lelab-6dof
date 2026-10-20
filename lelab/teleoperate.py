@@ -20,8 +20,7 @@ from typing import Any
 
 from pydantic import BaseModel
 
-from lerobot.robots.so_follower import SO101Follower, SO101FollowerConfig
-from lerobot.teleoperators.so_leader import SO101Leader, SO101LeaderConfig
+from .arduino_robot import ArduinoFollower, ArduinoFollowerConfig, ArduinoLeader, ArduinoLeaderConfig
 
 from .utils.config import setup_calibration_files
 from .utils.devices import safe_disconnect_device
@@ -61,12 +60,14 @@ def get_joint_positions_from_robot(robot) -> dict[str, float]:
     Returns:
         Dictionary mapping URDF joint names to radian values
     """
+    # Joint names follow the Arduino firmware order: base, shoulder, elbow,
+    # wrist, rotate, gripper.
     motor_to_urdf_mapping = {
-        "shoulder_pan": "Rotation",
-        "shoulder_lift": "Pitch",
-        "elbow_flex": "Elbow",
-        "wrist_flex": "Wrist_Pitch",
-        "wrist_roll": "Wrist_Roll",
+        "base": "Rotation",
+        "shoulder": "Pitch",
+        "elbow": "Elbow",
+        "wrist": "Wrist_Pitch",
+        "rotate": "Wrist_Roll",
         "gripper": "Jaw",
     }
 
@@ -142,12 +143,12 @@ def handle_start_teleoperation(request: TeleoperateRequest, websocket_manager=No
         )
 
         # Create robot and teleop configs
-        robot_config = SO101FollowerConfig(
+        robot_config = ArduinoFollowerConfig(
             port=request.follower_port,
             id=follower_config_name,
         )
 
-        teleop_config = SO101LeaderConfig(
+        teleop_config = ArduinoLeaderConfig(
             port=request.leader_port,
             id=leader_config_name,
         )
@@ -156,8 +157,8 @@ def handle_start_teleoperation(request: TeleoperateRequest, websocket_manager=No
         # other (so its serial port is released) and report the error — do NOT
         # leave the caller thinking teleoperation started.
         logger.info("Initializing robot and teleop device...")
-        robot = SO101Follower(robot_config)
-        teleop_device = SO101Leader(teleop_config)
+        robot = ArduinoFollower(robot_config)
+        teleop_device = ArduinoLeader(teleop_config)
 
         # Connect each arm separately so the error names which one failed and
         # tells the user what to do, instead of a generic "failed to start".
@@ -172,12 +173,32 @@ def handle_start_teleoperation(request: TeleoperateRequest, websocket_manager=No
 
         logger.info("Connecting to leader arm...")
         try:
-            teleop_device.bus.connect()
+            # The leader and follower are the same physical Arduino, so the
+            # leader reuses the follower's open serial connection instead of
+            # opening the port a second time.
+            if getattr(robot, "_driver", None) is not None and hasattr(teleop_device, "share_driver"):
+                teleop_device.share_driver(robot._driver)
+                teleop_device.bus.is_connected = True
+            else:
+                teleop_device.bus.connect()
         except Exception as e:
             raise RuntimeError(
                 f"Could not connect to the leader arm on {request.leader_port}. "
                 "Make sure it's plugged in and powered on, then try again."
             ) from e
+
+        # Give the leader's background gamepad search a moment to attach the
+        # controller before the teleoperation loop starts.
+        for _ in range(50):
+            if getattr(teleop_device, "_gamepad", None) is not None:
+                logger.info("⏳ Gamepad attached - starting teleoperation")
+                break
+            time.sleep(0.1)
+        else:
+            logger.warning(
+                "⚠️ No gamepad attached after 5s - the arm will not move. "
+                "Turn the ARIS on and make sure no other program holds it."
+            )
 
         # Write calibration to motors' memory
         logger.info("Writing calibration to motors...")
